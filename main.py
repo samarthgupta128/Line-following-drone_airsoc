@@ -1,7 +1,8 @@
 import argparse
 import cv2
 import numpy as np
-
+import time
+from pymavlink import mavutil
 
 def yellow_mask(image_bgr):
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
@@ -175,6 +176,84 @@ def parse_args():
     parser.add_argument("--contour-area", type=int, default=100, help="Minimum contour area")
     return parser.parse_args()
 
+
+# defsend_velocity_command(master, vx, vy, vz):
+# """
+# Sends a velocity command to the drone via MAVLink.
+# vx: Forward/Backward velocity (m/s)
+# vy: Right/Left velocity (m/s)
+# vz: Up/Down velocity (m/s)
+# """
+# master.mav.set_position_target_local_ned_send(
+#     0,  # time_boot_ms (not used)
+#     master.target_system, master.target_component,
+#     mavutil.mavlink.MAV_FRAME_LOCAL_NED,  # Frame of reference
+#     0b0000111111000111,  # Bitmask to indicate we are sending velocity, not position
+#     0, 0, 0,  # Position x, y, z (ignored)
+#     vx, vy, vz,  # Velocity x, y, z in m/s
+#     0, 0, 0,  # Acceleration (ignored)
+#     0, 0  # Yaw, yaw_rate (ignored)
+# )
+
+
+def run_drone_line_follower(input_source, connection_string, kp_gains, base_speed):
+    # 1. Connect to the Flight Controller
+    print(f"Connecting to vehicle on: {connection_string}")
+    master = mavutil.mavlink_connection(connection_string)
+    master.wait_heartbeat()
+    print("Heartbeat received! Vehicle connected.")
+
+    # 2. Setup Camera
+    try:
+        source = int(input_source)
+    except ValueError:
+        source = input_source
+
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video source: {input_source}")
+
+    print("Starting vision loop... Ensure drone is in GUIDED mode and flying.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Run your vision pipeline
+        mask = yellow_mask(frame)
+        mask_roi = apply_roi(mask, roi_top_ratio=0.3)  # Increased to ignore more horizon
+        mask_cleaned = keep_main_component(mask_roi, min_component_area=1200)
+        contour, cx, cy = detect_line_center(mask_cleaned, min_contour_area=100)
+        annotated, offset = annotate(frame, contour, cx, cy)
+
+        # 3. Calculate and Send Drone Commands
+        if offset is not None:
+            # Proportional controller: velocity proportional to the error (offset)
+            # Positive offset (line to the right) -> Positive Vy (move right)
+            vy = offset * kp_gains
+
+            # Cap the maximum sideways velocity for safety
+            vy = np.clip(vy, -1.0, 1.0)
+
+            # Send command: move forward at base_speed, move laterally at vy
+            send_velocity_command(master, vx=base_speed, vy=vy, vz=0.0)
+
+            cv2.putText(annotated, f"Cmd Vy: {vy:.2f} m/s", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            # If no line detected, stop moving forward to avoid getting lost
+            send_velocity_command(master, vx=0.0, vy=0.0, vz=0.0)
+            cv2.putText(annotated, "NO LINE: STOPPING", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow("Drone View", annotated)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Stop drone on exit
+    send_velocity_command(master, vx=0.0, vy=0.0, vz=0.0)
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     args = parse_args()
